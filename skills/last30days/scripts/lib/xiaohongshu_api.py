@@ -3,12 +3,23 @@
 Uses xpzouying/xiaohongshu-mcp REST endpoints:
 - GET/POST /api/v1/feeds/search
 - GET /api/v1/login/status
+
+Uses the shared engine http module (retries, timeout, fixture recording)
+instead of raw urllib. The XHS browser-automation backend is slow but the
+http module's retry logic and proper timeout handling keep it from hanging.
 """
 
+import json
+import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from . import http
+
+# XHS service chokes on concurrent requests (it's a browser-automation backend,
+# not a horizontally-scaled API). Serialize all calls through a module-level
+# lock so concurrent pipeline dispatches don't time out.
+_xhs_lock = threading.Lock()
 
 
 def _to_int(value: Any) -> int:
@@ -41,7 +52,6 @@ def _timestamp_to_date_ms(ts: Any) -> Optional[str]:
         iv = int(ts)
         if iv <= 0:
             return None
-        # API examples use milliseconds.
         dt = datetime.fromtimestamp(iv / 1000.0, tz=timezone.utc)
         return dt.strftime("%Y-%m-%d")
     except (TypeError, ValueError, OSError):
@@ -50,9 +60,7 @@ def _timestamp_to_date_ms(ts: Any) -> Optional[str]:
 
 def _relevance_from_interactions(likes: int, comments: int, favorites: int) -> float:
     """Heuristic relevance score from engagement metrics."""
-    # Weighted engagement with soft caps to [0, 1].
     weighted = (likes * 1.0) + (comments * 2.5) + (favorites * 1.5)
-    # 5000 weighted engagement ~= strong relevance.
     score = min(1.0, max(0.05, weighted / 5000.0))
     return round(score, 3)
 
@@ -76,34 +84,42 @@ def search_feeds(
     if not base:
         raise ValueError("Missing Xiaohongshu API base URL")
 
-    # Quick login sanity check.
-    login = http.get(f"{base}/api/v1/login/status", timeout=8, retries=1)
-    is_logged_in = (
-        login.get("data", {}).get("is_logged_in")
-        if isinstance(login, dict) else False
-    )
-    if not is_logged_in:
-        raise http.HTTPError("Xiaohongshu API reachable but not logged in")
+    # Serialize all HTTP calls to the XHS backend under a process-level lock.
+    # The browser-automation backend cannot handle concurrent requests and will
+    # hang or timeout when the pipeline fires multiple subqueries in parallel.
+    with _xhs_lock:
+        login = http.get(f"{base}/api/v1/login/status", timeout=15)
+        is_logged_in = (
+            login.get("data", {}).get("is_logged_in")
+            if isinstance(login, dict) else False
+        )
+        if not is_logged_in:
+            raise RuntimeError("Xiaohongshu API reachable but not logged in")
 
-    # API supports filters; use recency-oriented defaults.
-    publish_time = "一天内" if depth == "quick" else "一周内" if depth == "default" else "半年内"
-    payload = {
-        "keyword": topic,
-        "filters": {
-            "sort_by": "综合",
-            "note_type": "不限",
-            "publish_time": publish_time,
-            "search_scope": "不限",
-            "location": "不限",
-        },
-    }
+        # Use a broad publish_time window so the engine's own date-range filter
+        # (applied after retrieval) does the narrowing.
+        publish_time = "一天内" if depth == "quick" else "半年内"
+        payload = {
+            "keyword": topic,
+            "filters": {
+                "sort_by": "综合",
+                "note_type": "不限",
+                "publish_time": publish_time,
+                "search_scope": "不限",
+                "location": "不限",
+            },
+        }
 
-    resp = http.post(f"{base}/api/v1/feeds/search", payload, timeout=20, retries=1)
+        resp = http.request(
+            "POST",
+            f"{base}/api/v1/feeds/search",
+            json_data=payload,
+            timeout=60,
+        )
     feeds = resp.get("data", {}).get("feeds", []) if isinstance(resp, dict) else []
     if not isinstance(feeds, list):
         feeds = []
 
-    # Cap source volume similarly to other web sources.
     limit = {"quick": 8, "default": 15, "deep": 25}.get(depth, 15)
     items: List[Dict[str, Any]] = []
 
@@ -151,7 +167,6 @@ def search_feeds(
             "date_confidence": "high" if date_value else "low",
             "relevance": _relevance_from_interactions(likes, comments, favorites),
             "why_relevant": why,
-            # Keep raw engagement for debugging/possible future rendering.
             "engagement": {
                 "likes": likes,
                 "comments": comments,

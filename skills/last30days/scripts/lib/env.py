@@ -809,6 +809,7 @@ _X_BACKEND_OPT_IN = ("grok",)
 # All known backends (auto chain + opt-in): valid values for the pin var.
 _X_BACKEND_KNOWN = _X_BACKEND_ORDER + _X_BACKEND_OPT_IN
 
+
 # Public routing definitions for the doctor/backend-descriptor layer
 # (lib/backends.py). These are aliases for knowledge this module already
 # owns — the declared X chain order and the pin/floor env var names — so
@@ -881,7 +882,10 @@ def x_backend_chain(config: dict[str, Any], local_only: bool = False) -> list[st
     # Pin accepted from _X_BACKEND_KNOWN (auto chain + opt-in like grok).
     if preferred in _X_BACKEND_KNOWN:
         if _x_backend_available(preferred, config, has_bird_creds, local_only):
-            return [preferred]
+            return [preferred] + [
+                b for b in _X_BACKEND_ORDER
+                if b != preferred and _x_backend_available(b, config, has_bird_creds, local_only)
+            ]
         return []
 
     # Unpinned: walk only _X_BACKEND_ORDER (bird -> xai -> xurl -> xquik).
